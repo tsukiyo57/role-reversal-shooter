@@ -10,11 +10,10 @@ import type { Weights, SignalData } from "../types";
 
 const W = 640;
 const H = 480;
-const PLAYER_HP = 5;
-const HERO_HP_BASE = 8;
-const BULLET_SPEED = 350;
-const PLAYER_SPEED = 180;
-const STAGE_HP_SCALE = 1.3; // ステージごとにヒーローHP増加
+const PLAYER_HP = 10;
+const HERO_LIVES = 3;
+const BULLET_SPEED = 380;
+const PLAYER_SPEED = 200;
 
 export class GameScene extends Phaser.Scene {
   // --- ゲーム状態 ---
@@ -24,18 +23,20 @@ export class GameScene extends Phaser.Scene {
   private stageStartTime = 0;
 
   // --- エンティティ ---
-  private player!: Phaser.GameObjects.Arc;
+  private player!: Phaser.GameObjects.Arc;          // 物理ボディ(不可視)
+  private playerGfx!: Phaser.GameObjects.Graphics;  // ボス機体ビジュアル
   private hero!: Phaser.GameObjects.Image;
   private heroRt!: Phaser.GameObjects.RenderTexture;
   private playerBullets!: Phaser.Physics.Arcade.Group;
   private heroBullets!: Phaser.Physics.Arcade.Group;
 
-  // --- HP ---
+  // --- HP / 残機 ---
   private playerHp = PLAYER_HP;
-  private heroHp = HERO_HP_BASE;
-  private heroMaxHp = HERO_HP_BASE;
-  private heroHpFill!: Phaser.GameObjects.Rectangle;
-  private playerHpText!: Phaser.GameObjects.Text;
+  private playerHpFill!: Phaser.GameObjects.Rectangle;
+  private heroLives = HERO_LIVES;
+  private heroLivesText!: Phaser.GameObjects.Text;
+  private heroInvincible = false;
+  private heroRespawnTimer = 0;
 
   // --- システム ---
   private accumulator!: SignalAccumulator;
@@ -48,7 +49,7 @@ export class GameScene extends Phaser.Scene {
   private fireKey!: Phaser.Input.Keyboard.Key;
   private giveUpKey!: Phaser.Input.Keyboard.Key;
   private lastPlayerShot = 0;
-  private readonly PLAYER_FIRE_RATE = 300; // ms
+  private readonly PLAYER_FIRE_RATE = 280;
 
   // --- ヒーロー射撃タイマー ---
   private heroShootTimer = 0;
@@ -57,9 +58,18 @@ export class GameScene extends Phaser.Scene {
     super("GameScene");
   }
 
-  create(): void {
-    this.cameras.main.setBackgroundColor(0x0a0a1f);
+  init(data: { stage?: number; weights?: Weights }): void {
+    if (data.stage) this.stage = data.stage;
+    if (data.weights) this.weights = { ...data.weights };
+    this.playerHp = PLAYER_HP;
+    this.heroLives = HERO_LIVES;
+    this.heroInvincible = false;
+  }
 
+  create(): void {
+    this.cameras.main.setBackgroundColor(0x04040f);
+
+    this.createStarfield();
     this.initSystems();
     this.initUI();
     this.initEntities();
@@ -68,6 +78,36 @@ export class GameScene extends Phaser.Scene {
     this.stageStartTime = this.time.now;
   }
 
+  // ─── 星空背景 ───────────────────────────────────────────────
+  private createStarfield(): void {
+    const g = this.add.graphics();
+
+    // 遠い星 (暗め・小さい)
+    for (let i = 0; i < 120; i++) {
+      const x = Phaser.Math.Between(0, W);
+      const y = Phaser.Math.Between(0, H);
+      const size = Math.random() < 0.15 ? 1.2 : 0.7;
+      const alpha = 0.15 + Math.random() * 0.35;
+      g.fillStyle(0xaabbff, alpha);
+      g.fillCircle(x, y, size);
+    }
+    // 明るい星 (少数)
+    for (let i = 0; i < 25; i++) {
+      const x = Phaser.Math.Between(0, W);
+      const y = Phaser.Math.Between(0, H);
+      g.fillStyle(0xffffff, 0.6 + Math.random() * 0.4);
+      g.fillCircle(x, y, 0.8);
+    }
+    // 遠くの星雲 (ぼんやりした大きい楕円)
+    for (let i = 0; i < 3; i++) {
+      const x = Phaser.Math.Between(50, W - 50);
+      const y = Phaser.Math.Between(50, H - 50);
+      g.fillStyle(0x334477, 0.08);
+      g.fillEllipse(x, y, 200, 80);
+    }
+  }
+
+  // ─── システム初期化 ───────────────────────────────────────
   private initSystems(): void {
     this.accumulator = new SignalAccumulator(W, H);
     this.eventLog = new EventLog();
@@ -75,52 +115,74 @@ export class GameScene extends Phaser.Scene {
     this.debugHud = new DebugHUD(this);
   }
 
+  // ─── UI ──────────────────────────────────────────────────
   private initUI(): void {
-    // ヒーローHP バー (上部)
-    this.add.rectangle(W / 2, 18, 200, 12, 0x333355).setOrigin(0.5, 0.5);
-    this.heroHpFill = this.add.rectangle(W / 2 - 98, 18, 196, 8, 0x5566ff).setOrigin(0, 0.5);
-    this.add.text(W / 2, 30, "HERO HP", { fontFamily: "monospace", fontSize: "9px", color: "#8888cc" }).setOrigin(0.5, 0);
-
-    // プレイヤーHP テキスト (下部)
-    this.playerHpText = this.add.text(10, H - 22, `❤ x${this.playerHp}`, {
-      fontFamily: "monospace", fontSize: "14px", color: "#ff6677",
+    // ── 上部左: ヒーロー残機 ──
+    this.add.text(14, 10, "HERO", {
+      fontFamily: "monospace", fontSize: "9px", color: "#4466cc",
+    });
+    this.heroLivesText = this.add.text(14, 22, this.heroLivesStr(), {
+      fontFamily: "monospace", fontSize: "15px", color: "#7799ff",
     });
 
-    // ステージ表示
-    this.add.text(W / 2, 8, `STAGE ${this.stage}`, {
-      fontFamily: "monospace", fontSize: "11px", color: "#aaaaee",
+    // ── 上部中央: ステージ ──
+    const stageLabel = this.add.text(W / 2, 10, `◈  STAGE ${this.stage}  ◈`, {
+      fontFamily: "monospace", fontSize: "11px", color: "#556688",
     }).setOrigin(0.5, 0);
+    this.tweens.add({
+      targets: stageLabel,
+      alpha: { from: 1, to: 0.4 },
+      duration: 1200,
+      yoyo: true,
+      repeat: -1,
+    });
+
+    // ── 下部: ボスHPバー ──
+    const barY = H - 20;
+    this.add.text(W / 2, barY - 13, "BOSS  HP", {
+      fontFamily: "monospace", fontSize: "9px", color: "#cc3344",
+    }).setOrigin(0.5, 1);
+    // バー外枠
+    this.add.rectangle(W / 2, barY, 304, 14, 0x110008).setStrokeStyle(1, 0x661122);
+    // バー本体
+    this.playerHpFill = this.add
+      .rectangle(W / 2 - 150, barY, 300, 10, 0xee1133)
+      .setOrigin(0, 0.5);
 
     // ヒント
-    this.add.text(W - 8, H - 12, "[Z] 射撃  [D] DEBUG", {
-      fontFamily: "monospace", fontSize: "9px", color: "#445566",
+    this.add.text(W - 8, H - 6, "[Z]射撃  [G]ギブアップ  [D]DEBUG", {
+      fontFamily: "monospace", fontSize: "8px", color: "#2a3a4a",
     }).setOrigin(1, 1);
   }
 
-  private initEntities(): void {
-    // プレイヤー (下部・緑の三角形をArcで代替)
-    this.player = this.add.arc(W / 2, H - 60, 14, 0, 360, false, 0x44ff88);
-    this.physics.add.existing(this.player);
-    (this.player.body as Phaser.Physics.Arcade.Body).setCollideWorldBounds(true);
+  private heroLivesStr(): string {
+    return "◆".repeat(this.heroLives) + "◇".repeat(HERO_LIVES - this.heroLives);
+  }
 
-    // ヒーロー RenderTexture (上部)
-    this.heroRt = this.add.renderTexture(W / 2, 80, 80, 80).setOrigin(0.5, 0.5);
+  // ─── エンティティ ─────────────────────────────────────────
+  private initEntities(): void {
+    // ヒーロー (上部)
+    this.heroRt = this.add.renderTexture(W / 2, 95, 80, 80).setOrigin(0.5, 0.5);
     ShipVisualizer.bake(this, this.heroRt, this.weights);
 
-    // ヒーロー の物理ボディ用の不可視 Arc
-    this.hero = this.add.image(W / 2, 80, "__DEFAULT").setAlpha(0);
+    this.hero = this.add.image(W / 2, 95, "__DEFAULT").setAlpha(0);
     this.physics.add.existing(this.hero);
     (this.hero.body as Phaser.Physics.Arcade.Body)
       .setCircle(ShipVisualizer.HITBOX_RADIUS)
       .setCollideWorldBounds(true);
 
+    // プレイヤー(ボス) 物理ボディ (不可視 Arc)
+    this.player = this.add.arc(W / 2, H - 70, 20, 0, 360, false, 0x00ff88).setAlpha(0);
+    this.physics.add.existing(this.player);
+    (this.player.body as Phaser.Physics.Arcade.Body).setCollideWorldBounds(true);
+
+    // ボス機体グラフィック
+    this.playerGfx = this.add.graphics();
+    this.drawBossShip(W / 2, H - 70);
+
     // 弾グループ
     this.playerBullets = this.physics.add.group();
     this.heroBullets = this.physics.add.group();
-
-    // HP 計算
-    this.heroHp = Math.round(HERO_HP_BASE * Math.pow(STAGE_HP_SCALE, this.stage - 1));
-    this.heroMaxHp = this.heroHp;
 
     // 入力
     this.cursors = this.input.keyboard!.createCursorKeys();
@@ -128,148 +190,235 @@ export class GameScene extends Phaser.Scene {
     this.giveUpKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
   }
 
-  private initPhysics(): void {
-    // プレイヤー弾 → ヒーロー当たり判定
-    this.physics.add.overlap(
-      this.playerBullets,
-      this.hero,
-      (_, bullet) => {
-        (bullet as Phaser.GameObjects.Arc).destroy();
-        this.heroHp--;
-        this.updateHeroHpBar();
-        if (this.heroHp <= 0) this.stageClear();
-      },
-    );
+  /**
+   * ボス機体を指定座標に描画する。
+   * 毎フレーム clear() して再描画することで移動に追従する。
+   */
+  private drawBossShip(cx: number, cy: number): void {
+    const g = this.playerGfx;
+    g.clear();
 
-    // ヒーロー弾 → プレイヤー当たり判定
-    this.physics.add.overlap(
-      this.heroBullets,
-      this.player,
-      (_, bullet) => {
-        (bullet as Phaser.GameObjects.Arc).destroy();
-        this.playerHp--;
-        this.playerHpText.setText(`❤ x${this.playerHp}`);
-        if (this.playerHp <= 0) this.gameOver();
-      },
-    );
+    // 翼 (左右の三角)
+    g.fillStyle(0x005533, 1);
+    g.fillTriangle(cx, cy + 4, cx - 36, cy + 22, cx - 14, cy + 8);
+    g.fillTriangle(cx, cy + 4, cx + 36, cy + 22, cx + 14, cy + 8);
+
+    // 胴体シルエット
+    g.fillStyle(0x007744, 1);
+    g.fillTriangle(cx, cy - 24, cx - 16, cy + 18, cx + 16, cy + 18);
+
+    // エンジンポッド (下部)
+    g.fillStyle(0x004422, 1);
+    g.fillRect(cx - 18, cy + 14, 10, 12);
+    g.fillRect(cx + 8, cy + 14, 10, 12);
+
+    // エンジン炎
+    const flicker = 0.7 + Math.random() * 0.3;
+    g.fillStyle(0x00ffaa, flicker);
+    g.fillTriangle(cx - 13, cy + 26, cx - 11, cy + 26, cx - 12, cy + 34);
+    g.fillTriangle(cx + 13, cy + 26, cx + 11, cy + 26, cx + 12, cy + 34);
+
+    // コア (中心の光る部分)
+    g.fillStyle(0x003322, 1);
+    g.fillCircle(cx, cy + 2, 10);
+    g.fillStyle(0x00ff88, 0.9);
+    g.fillCircle(cx, cy + 2, 7);
+    g.fillStyle(0xaaffdd, 0.8);
+    g.fillCircle(cx - 2, cy, 3);
+
+    // エネルギーリング
+    g.lineStyle(1, 0x00ffaa, 0.4);
+    g.strokeCircle(cx, cy + 2, 14);
+
+    // 機首キャノン
+    g.fillStyle(0x00aa66, 1);
+    g.fillRect(cx - 2, cy - 30, 4, 8);
+    g.fillStyle(0x00ffaa, 0.7);
+    g.fillCircle(cx, cy - 30, 2.5);
   }
 
+  // ─── 物理 ────────────────────────────────────────────────
+  private initPhysics(): void {
+    // プレイヤー弾 → ヒーロー
+    this.physics.add.overlap(this.playerBullets, this.hero, (_, bullet) => {
+      if (this.heroInvincible) return;
+      (bullet as Phaser.GameObjects.Arc).destroy();
+      this.onHeroHit();
+    });
+
+    // ヒーロー弾 → プレイヤー(ボス)
+    this.physics.add.overlap(this.heroBullets, this.player, (_, bullet) => {
+      (bullet as Phaser.GameObjects.Arc).destroy();
+      this.onPlayerHit();
+    });
+  }
+
+  // ─── 毎フレーム更新 ───────────────────────────────────────
   update(_time: number, delta: number): void {
     const dt = delta / 1000;
+
+    // 無敵タイマー
+    if (this.heroInvincible) {
+      this.heroRespawnTimer -= delta;
+      if (this.heroRespawnTimer <= 0) {
+        this.heroInvincible = false;
+        this.heroRt.setAlpha(1);
+      }
+    }
+
     const px = this.player.x;
     const py = this.player.y;
     const hx = this.hero.x;
     const hy = this.hero.y;
 
-    // --- プレイヤー操作 ---
+    // ── プレイヤー操作 ──
     const body = this.player.body as Phaser.Physics.Arcade.Body;
     body.setVelocity(0, 0);
-    if (this.cursors.left.isDown) body.setVelocityX(-PLAYER_SPEED);
+    if (this.cursors.left.isDown)  body.setVelocityX(-PLAYER_SPEED);
     if (this.cursors.right.isDown) body.setVelocityX(PLAYER_SPEED);
-    if (this.cursors.up.isDown) body.setVelocityY(-PLAYER_SPEED);
-    if (this.cursors.down.isDown) body.setVelocityY(PLAYER_SPEED);
+    if (this.cursors.up.isDown)    body.setVelocityY(-PLAYER_SPEED);
+    if (this.cursors.down.isDown)  body.setVelocityY(PLAYER_SPEED);
 
-    // --- プレイヤー射撃 ---
+    // ボス機体をボディに追従
+    this.drawBossShip(this.player.x, this.player.y);
+
+    // ── 射撃 ──
     const now = this.time.now;
     if (this.fireKey.isDown && now - this.lastPlayerShot > this.PLAYER_FIRE_RATE) {
       this.firePlayerBullet(px, py, hx, hy);
       this.lastPlayerShot = now;
     }
 
-    // --- シグナル収集 ---
+    // ── シグナル収集 ──
     this.accumulator.tick(px, py, hx, hy);
 
-    // ギブアップ [G]
+    // ── ギブアップ [G] ──
     if (Phaser.Input.Keyboard.JustDown(this.giveUpKey)) {
       this.gameOver();
       return;
     }
 
-    // --- AI ヒーロー更新 ---
-    const { vx, vy, shoot } = this.heroCtrl.update(
-      dt, hx, hy, px, py, this.heroHp, this.heroMaxHp,
-    );
+    // ── AI ヒーロー更新 ──
+    // 残機をHP的な値にマッピング (1残機=低HP → DODGEモード発動)
+    const fakeHp = ([0, 2, 5, 10] as const)[Math.max(0, Math.min(3, this.heroLives))];
+    const { vx, vy, shoot } = this.heroCtrl.update(dt, hx, hy, px, py, fakeHp, 10);
     (this.hero.body as Phaser.Physics.Arcade.Body).setVelocity(vx, vy);
     this.heroRt.setPosition(this.hero.x, this.hero.y);
 
-    // ヒーロー射撃
-    this.heroShootTimer -= delta;
-    if (shoot && this.heroShootTimer <= 0) {
-      this.fireHeroBullet(hx, hy, px, py);
-      const burstInterval = 600 - this.weights.burstTiming * 300; // 300–600ms
-      this.heroShootTimer = burstInterval;
+    // ── ヒーロー射撃 ──
+    if (!this.heroInvincible) {
+      this.heroShootTimer -= delta;
+      if (shoot && this.heroShootTimer <= 0) {
+        this.fireHeroBullet(hx, hy, px, py);
+        const interval = 600 - this.weights.burstTiming * 300;
+        this.heroShootTimer = interval;
+      }
     }
 
-    // 古い弾を削除
-    this.playerBullets.children.each((b) => {
-      const bullet = b as Phaser.GameObjects.Arc;
-      if (bullet.y < -10 || bullet.y > H + 10 || bullet.x < -10 || bullet.x > W + 10) {
-        bullet.destroy();
-      }
-      return true;
-    });
-    this.heroBullets.children.each((b) => {
-      const bullet = b as Phaser.GameObjects.Arc;
-      if (bullet.y < -10 || bullet.y > H + 10 || bullet.x < -10 || bullet.x > W + 10) {
-        bullet.destroy();
-      }
-      return true;
-    });
+    // ── 範囲外弾の削除 ──
+    this.cleanupBullets(this.playerBullets);
+    this.cleanupBullets(this.heroBullets);
 
-    // --- デバッグHUD 更新 ---
-    // 表示用の現在シグナル (蓄積中の暫定値)
+    // ── デバッグ HUD ──
     const liveDuration = this.time.now - this.stageStartTime;
     const liveFireRate = this.eventLog.getFireRate(liveDuration);
     const liveSignals = this.accumulator.normalize(liveFireRate);
     this.debugHud.update(liveSignals, this.weights, this.heroCtrl.getState());
   }
 
+  // ─── 弾発射 ──────────────────────────────────────────────
   private firePlayerBullet(px: number, py: number, tx: number, ty: number): void {
     const angle = Math.atan2(ty - py, tx - px);
-    const bullet = this.add.arc(px, py, 4, 0, 360, false, 0x44ffaa);
-    this.physics.add.existing(bullet);
-    (bullet.body as Phaser.Physics.Arcade.Body).setVelocity(
-      Math.cos(angle) * BULLET_SPEED,
-      Math.sin(angle) * BULLET_SPEED,
-    );
-    this.playerBullets.add(bullet);
+    const spread = (Math.random() - 0.5) * 0.12;
 
-    // シグナル記録
+    // ★ group.add() してから setVelocity — 順序が重要
+    const bullet = this.add.arc(px, py - 12, 4, 0, 360, false, 0x00ffbb);
+    bullet.setDepth(5);
+    this.playerBullets.add(bullet);
+    (bullet.body as Phaser.Physics.Arcade.Body).setVelocity(
+      Math.cos(angle + spread) * BULLET_SPEED,
+      Math.sin(angle + spread) * BULLET_SPEED,
+    );
+
     this.accumulator.recordShot(angle);
     this.eventLog.recordShot(this.time.now);
   }
 
   private fireHeroBullet(hx: number, hy: number, tx: number, ty: number): void {
     const angle = Math.atan2(ty - hy, tx - hx);
-    const bullet = this.add.arc(hx, hy, 5, 0, 360, false, 0xff4466);
-    this.physics.add.existing(bullet);
-    (bullet.body as Phaser.Physics.Arcade.Body).setVelocity(
-      Math.cos(angle) * BULLET_SPEED * 0.9,
-      Math.sin(angle) * BULLET_SPEED * 0.9,
-    );
+
+    const bullet = this.add.arc(hx, hy + 12, 5, 0, 360, false, 0xff2244);
+    bullet.setDepth(5);
     this.heroBullets.add(bullet);
+    (bullet.body as Phaser.Physics.Arcade.Body).setVelocity(
+      Math.cos(angle) * BULLET_SPEED * 0.85,
+      Math.sin(angle) * BULLET_SPEED * 0.85,
+    );
   }
 
-  private updateHeroHpBar(): void {
-    const ratio = Math.max(0, this.heroHp / this.heroMaxHp);
-    this.heroHpFill.width = 196 * ratio;
+  private cleanupBullets(group: Phaser.Physics.Arcade.Group): void {
+    group.children.each((b) => {
+      const bullet = b as Phaser.GameObjects.Arc;
+      if (bullet.y < -20 || bullet.y > H + 20 || bullet.x < -20 || bullet.x > W + 20) {
+        bullet.destroy();
+      }
+      return true;
+    });
   }
 
+  // ─── ヒット処理 ──────────────────────────────────────────
+  private onHeroHit(): void {
+    this.heroLives = Math.max(0, this.heroLives - 1);
+    this.heroLivesText.setText(this.heroLivesStr());
+
+    if (this.heroLives <= 0) {
+      this.stageClear();
+      return;
+    }
+
+    // 残機あり → 無敵 + リスポーン
+    this.heroInvincible = true;
+    this.heroRespawnTimer = 2200;
+
+    // 中央上部にリセット
+    (this.hero.body as Phaser.Physics.Arcade.Body).reset(W / 2, 95);
+    this.heroRt.setPosition(W / 2, 95);
+
+    // 点滅 tween
+    this.tweens.add({
+      targets: this.heroRt,
+      alpha: { from: 0.2, to: 0.85 },
+      duration: 180,
+      repeat: 10,
+      yoyo: true,
+      onComplete: () => { this.heroRt.setAlpha(1); },
+    });
+
+    // 画面フラッシュ (青)
+    this.cameras.main.flash(300, 0, 80, 200, false);
+  }
+
+  private onPlayerHit(): void {
+    this.playerHp = Math.max(0, this.playerHp - 1);
+    this.playerHpFill.width = (this.playerHp / PLAYER_HP) * 300;
+
+    // 画面フラッシュ (赤)
+    this.cameras.main.flash(200, 200, 0, 0, false);
+
+    if (this.playerHp <= 0) this.gameOver();
+  }
+
+  // ─── ステージクリア / ゲームオーバー ─────────────────────
   private stageClear(): void {
-    // シグナル集計
     const duration = this.time.now - this.stageStartTime;
     const fireRate = this.eventLog.getFireRate(duration);
     this.signals = this.accumulator.normalize(fireRate);
-
-    // ウェイト更新
     this.weights = updateWeights(this.weights, this.signals);
 
-    // リセット
     this.accumulator.reset();
     this.eventLog.reset();
     this.stage++;
 
-    // シーン再起動で次ステージへ
     this.scene.restart({ stage: this.stage, weights: this.weights });
   }
 
@@ -278,11 +427,5 @@ export class GameScene extends Phaser.Scene {
       weights: { ...this.weights },
       stageReached: this.stage,
     });
-  }
-
-  init(data: { stage?: number; weights?: Weights }): void {
-    if (data.stage) this.stage = data.stage;
-    if (data.weights) this.weights = data.weights;
-    this.playerHp = PLAYER_HP;
   }
 }
