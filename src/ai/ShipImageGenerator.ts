@@ -1,6 +1,8 @@
 import type { Weights } from "../types";
 
-const COMFY_URL = "http://localhost:8188";
+// Vite dev server proxies /comfy/* → localhost:8188 (vite.config.ts)
+// In production (GitHub Pages), /comfy/* is unreachable → isAvailable() returns false → fallback
+const COMFY_URL = "/comfy";
 const CHECKPOINT = "animagine-xl-4.0.safetensors";
 
 /**
