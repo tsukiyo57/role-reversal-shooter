@@ -139,12 +139,12 @@ async function removeBackground(blob: Blob): Promise<Blob> {
   const visited = new Uint8Array(w * h);
   const queue: number[] = [];
 
-  const isBright = (idx: number) => {
+  // 純白に近いピクセルのみ背景と判定。機体の白・グレー部分を保護するため厳しめの閾値
+  const isBg = (idx: number) => {
     const r = px[idx], g = px[idx + 1], b = px[idx + 2];
-    // 彩度が低く明るいピクセルのみ背景と判定（色のついた機体部分を保護）
     const brightness = (r + g + b) / 3;
     const saturation = Math.max(r, g, b) - Math.min(r, g, b);
-    return brightness > 230 && saturation < 20;
+    return brightness > 245 && saturation < 15;
   };
 
   // 4辺のピクセルをシードとしてキューに追加
@@ -156,35 +156,13 @@ async function removeBackground(blob: Blob): Promise<Blob> {
     if (visited[pos]) continue;
     visited[pos] = 1;
     const pidx = pos * 4;
-    if (!isBright(pidx)) continue;
+    if (!isBg(pidx)) continue;
     px[pidx + 3] = 0; // 透過
     const x = pos % w, y = Math.floor(pos / w);
     if (x > 0)     queue.push(pos - 1);
     if (x < w - 1) queue.push(pos + 1);
     if (y > 0)     queue.push(pos - w);
     if (y < h - 1) queue.push(pos + w);
-  }
-
-  // 背景除去済みピクセルに隣接する低彩度グレー（影）も透過にする
-  const shadow = new Uint8Array(w * h);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const pos = y * w + x;
-      const pidx = pos * 4;
-      if (px[pidx + 3] > 0) continue; // 既に透過済みはスキップ
-      // 隣接4ピクセルにまだ不透明なものがあるか確認
-      const neighbors = [pos - 1, pos + 1, pos - w, pos + w];
-      const nextToOpaque = neighbors.some(n => n >= 0 && n < w * h && px[n * 4 + 3] > 0);
-      if (!nextToOpaque) continue;
-      // 影判定: 低彩度かつ中間輝度（白背景に落ちた影）
-      const r = px[pidx], g = px[pidx + 1], b = px[pidx + 2];
-      const brightness = (r + g + b) / 3;
-      const saturation = Math.max(r, g, b) - Math.min(r, g, b);
-      if (brightness > 150 && saturation < 40) shadow[pos] = 1;
-    }
-  }
-  for (let i = 0; i < w * h; i++) {
-    if (shadow[i]) px[i * 4 + 3] = 0;
   }
 
   ctx.putImageData(data, 0, 0);

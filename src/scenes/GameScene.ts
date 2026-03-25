@@ -146,7 +146,7 @@ export class GameScene extends Phaser.Scene {
       ? this.heroTextureKey
       : (this.textures.exists("hero_default") ? "hero_default" : null);
     if (texKey) {
-      const tempImg = this.add.image(-1000, -1000, texKey);
+      const tempImg = this.add.image(0, 0, texKey);
       const src = this.textures.get(texKey).getSourceImage() as HTMLImageElement;
       const sc = Math.min(88 / src.width, 88 / src.height);
       tempImg.setScale(sc);

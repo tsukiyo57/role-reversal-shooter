@@ -71,7 +71,7 @@ export class StageClearScene extends Phaser.Scene {
     // 進化前: AI生成済みテクスチャがあればそれを使用、なければ手続き型
     const rtPrev = this.add.renderTexture(prevX, shipY, 100, 100).setOrigin(0.5, 0.5).setAlpha(0.55);
     if (this.prevHeroTextureKey && this.textures.exists(this.prevHeroTextureKey)) {
-      const tempImg = this.add.image(-1000, -1000, this.prevHeroTextureKey);
+      const tempImg = this.add.image(0, 0, this.prevHeroTextureKey);
       const src = this.textures.get(this.prevHeroTextureKey).getSourceImage() as HTMLImageElement;
       const sc = Math.min(88 / src.width, 88 / src.height);
       tempImg.setScale(sc);
