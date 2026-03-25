@@ -82,10 +82,10 @@ export class StageClearScene extends Phaser.Scene {
     }
     rtPrev.setScale(1.3);
 
-    // 進化後: AI 生成を試みる (ローディング表示 → 差し替え)
-    const rtNew = this.add.renderTexture(nextX, shipY, 100, 100).setOrigin(0.5, 0.5);
-    ShipVisualizer.bake(this, rtNew, this.newWeights);
-    rtNew.setScale(1.3);
+    // 進化後: 手続き型描画をプレースホルダーとして表示し、AI 生成で差し替える
+    const gNew = this.add.graphics().setPosition(nextX, shipY);
+    ShipVisualizer.draw(gNew, this.newWeights);
+    gNew.setScale(1.3);
 
     // 光彩
     const aura = this.add.graphics();
@@ -94,7 +94,7 @@ export class StageClearScene extends Phaser.Scene {
     aura.setDepth(-1);
 
     this.tweens.add({
-      targets: rtNew, alpha: { from: 1, to: 0.72 },
+      targets: gNew, alpha: { from: 1, to: 0.72 },
       duration: 900, yoyo: true, repeat: -1,
     });
 
@@ -104,7 +104,7 @@ export class StageClearScene extends Phaser.Scene {
     }).setOrigin(0.5, 0);
 
     // ComfyUI 利用可能なら非同期生成
-    this.tryAIGeneration(rtNew, aiLabel, nextX, shipY);
+    this.tryAIGeneration(gNew, aiLabel, nextX, shipY);
 
     // ── 進化ログ ──
     const logY = 258;
@@ -148,7 +148,7 @@ export class StageClearScene extends Phaser.Scene {
   //  AI 画像生成 (非同期、失敗してもフォールバック済み)
   // ─────────────────────────────────────────────────────────
   private async tryAIGeneration(
-    rt: Phaser.GameObjects.RenderTexture,
+    placeholder: Phaser.GameObjects.Graphics,
     label: Phaser.GameObjects.Text,
     x: number,
     y: number,
@@ -159,33 +159,16 @@ export class StageClearScene extends Phaser.Scene {
 
     label.setText("AI 生成中…").setColor("#558866");
 
-    // 手続き型RTをベース画像としてキャプチャ（平面視を保証するため）
-    const baseBlob = await new Promise<Blob | null>((resolve) => {
-      try {
-        rt.snapshot((snap) => {
-          if (!(snap instanceof HTMLImageElement)) { resolve(null); return; }
-          const canvas = document.createElement("canvas");
-          canvas.width = 512; canvas.height = 512;
-          const ctx = canvas.getContext("2d")!;
-          ctx.fillStyle = "white";
-          ctx.fillRect(0, 0, 512, 512);
-          ctx.imageSmoothingEnabled = false;
-          ctx.drawImage(snap, 0, 0, 512, 512);
-          canvas.toBlob(b => resolve(b), "image/png");
-        });
-      } catch { resolve(null); }
-    });
-
     // 生成中アニメーション
     const loadingTween = this.tweens.add({
-      targets: rt, alpha: { from: 0.3, to: 0.9 },
+      targets: placeholder, alpha: { from: 0.3, to: 0.9 },
       duration: 400, yoyo: true, repeat: -1,
     });
 
-    const blobUrl = await ShipImageGenerator.generate(this.newWeights, baseBlob);
+    const blobUrl = await ShipImageGenerator.generate(this.newWeights);
 
     loadingTween.stop();
-    this.tweens.killTweensOf(rt);
+    this.tweens.killTweensOf(placeholder);
 
     console.log("[StageClearScene] blobUrl:", blobUrl, "isActive:", this.scene.isActive());
     if (!blobUrl || !this.scene.isActive()) {
@@ -193,19 +176,17 @@ export class StageClearScene extends Phaser.Scene {
       return;
     }
 
-    // 生成成功: 画像テクスチャとして読み込んでRTに差し替え
-    // タイムスタンプで一意なキーにしてPhaserキャッシュ衝突を回避
+    // 生成成功: 画像テクスチャとして読み込んでプレースホルダーと差し替え
     const key = `ai_ship_${Date.now()}`;
 
     const onLoaded = () => {
       if (!this.scene.isActive()) return;
-      const img = this.add.image(x, y, key).setOrigin(0.5, 0.5);
-      const maxSize = 130;
       const tex = this.textures.get(key).getSourceImage() as HTMLImageElement;
+      const maxSize = 130;
       const scale = Math.min(maxSize / tex.width, maxSize / tex.height);
-      img.setScale(scale);
-      img.setDepth(rt.depth + 1);
-      rt.setVisible(false);
+      const img = this.add.image(x, y, key).setOrigin(0.5, 0.5).setScale(scale);
+      img.setDepth(placeholder.depth + 1);
+      placeholder.setVisible(false);
 
       this.tweens.add({
         targets: img, alpha: { from: 1, to: 0.72 },
@@ -218,7 +199,6 @@ export class StageClearScene extends Phaser.Scene {
     };
 
     if (this.textures.exists(key)) {
-      // 既にキャッシュ済み (通常は起きないがフォールバック)
       onLoaded();
     } else {
       this.load.image(key, blobUrl);

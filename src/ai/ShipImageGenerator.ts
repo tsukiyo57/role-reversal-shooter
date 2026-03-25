@@ -22,32 +22,11 @@ export class ShipImageGenerator {
   /** ウェイトから機体画像を生成して Blob URL を返す。失敗時は null。
    *  baseBlob: 手続き型描画のキャプチャ。img2img で視点を固定するために使う。
    */
-  static async generate(weights: Weights, baseBlob?: Blob | null): Promise<string | null> {
+  static async generate(weights: Weights): Promise<string | null> {
     try {
       const clientId = crypto.randomUUID();
-
-      // ベース画像をアップロードしてimg2imgのファイル名を取得
-      let baseImageName: string | null = null;
-      if (baseBlob) {
-        try {
-          const form = new FormData();
-          form.append("image", baseBlob, "base_ship.png");
-          const up = await fetch(`${COMFY_URL}/upload/image`, {
-            method: "POST", body: form,
-            signal: AbortSignal.timeout(8000),
-          });
-          if (up.ok) {
-            const json = (await up.json()) as { name: string };
-            baseImageName = json.name;
-            console.log("[ShipImageGenerator] Uploaded base image:", baseImageName);
-          }
-        } catch {
-          console.warn("[ShipImageGenerator] Failed to upload base image, falling back to txt2img");
-        }
-      }
-
-      const workflow = buildWorkflow(weights, clientId, baseImageName);
-      console.log("[ShipImageGenerator] Submitting workflow, img2img:", !!baseImageName);
+      const workflow = buildWorkflow(weights, clientId);
+      console.log("[ShipImageGenerator] Submitting txt2img workflow");
 
       // ① ワークフローをキュー投入
       const queueRes = await fetch(`${COMFY_URL}/prompt`, {
@@ -223,21 +202,8 @@ function buildNegativePrompt(): string {
 //  ComfyUI ワークフロー (animagine-xl-4.0 / SDXL)
 // ─────────────────────────────────────────────────────────
 
-function buildWorkflow(weights: Weights, _clientId: string, baseImageName: string | null): object {
+function buildWorkflow(weights: Weights, _clientId: string): object {
   const seed = Math.floor(Math.random() * 2 ** 32);
-
-  // img2img: ベース画像あり → LoadImage→VAEEncode、denoise=0.7で視点を保持
-  // txt2img: ベース画像なし → EmptyLatentImage、denoise=1
-  const useImg2Img = !!baseImageName;
-
-  const latentNode = useImg2Img
-    ? {
-        "4a": { class_type: "LoadImage",  inputs: { image: baseImageName, upload: "image" } },
-        "4b": { class_type: "VAEEncode",  inputs: { pixels: ["4a", 0], vae: ["1", 2] } },
-      }
-    : {
-        "4b": { class_type: "EmptyLatentImage", inputs: { width: 512, height: 512, batch_size: 1 } },
-      };
 
   return {
     "1": {
@@ -252,20 +218,23 @@ function buildWorkflow(weights: Weights, _clientId: string, baseImageName: strin
       class_type: "CLIPTextEncode",
       inputs: { clip: ["1", 1], text: buildNegativePrompt() },
     },
-    ...latentNode,
+    "4": {
+      class_type: "EmptyLatentImage",
+      inputs: { width: 1024, height: 1024, batch_size: 1 },
+    },
     "5": {
       class_type: "KSampler",
       inputs: {
         model:        ["1", 0],
         positive:     ["2", 0],
         negative:     ["3", 0],
-        latent_image: ["4b", 0],
+        latent_image: ["4", 0],
         seed,
         steps:        25,
         cfg:          5,
         sampler_name: "dpmpp_2m_sde",
         scheduler:    "karras",
-        denoise:      useImg2Img ? 0.85 : 1,
+        denoise:      1,
       },
     },
     "6": {
