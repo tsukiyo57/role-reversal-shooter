@@ -3,7 +3,7 @@ import type { Weights } from "../types";
 // Vite dev server proxies /comfy/* → localhost:8188 (vite.config.ts)
 // In production (GitHub Pages), /comfy/* is unreachable → isAvailable() returns false → fallback
 const COMFY_URL = "/comfy";
-const CHECKPOINT = "animagine-xl-4.0.safetensors";
+const CHECKPOINT = "ziovXLScifi_v10.safetensors";
 
 /**
  * ComfyUI (localhost:8188) を使ってウェイトベースの機体画像を生成する。
@@ -230,8 +230,8 @@ function buildWorkflow(weights: Weights, _clientId: string): object {
         negative:     ["3", 0],
         latent_image: ["4", 0],
         seed,
-        steps:        25,
-        cfg:          5,
+        steps:        30,
+        cfg:          7,
         sampler_name: "dpmpp_2m_sde",
         scheduler:    "karras",
         denoise:      1,
