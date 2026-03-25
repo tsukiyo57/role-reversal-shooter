@@ -154,6 +154,7 @@ export class StageClearScene extends Phaser.Scene {
     y: number,
   ): Promise<void> {
     const available = await ShipImageGenerator.isAvailable();
+    console.log("[StageClearScene] ComfyUI available:", available);
     if (!available) return;
 
     label.setText("AI 生成中…").setColor("#558866");
@@ -186,7 +187,11 @@ export class StageClearScene extends Phaser.Scene {
     loadingTween.stop();
     this.tweens.killTweensOf(rt);
 
-    if (!blobUrl || !this.scene.isActive()) return;
+    console.log("[StageClearScene] blobUrl:", blobUrl, "isActive:", this.scene.isActive());
+    if (!blobUrl || !this.scene.isActive()) {
+      label.setText(blobUrl ? "シーン終了" : "生成失敗").setColor("#554433");
+      return;
+    }
 
     // 生成成功: 画像テクスチャとして読み込んでRTに差し替え
     // タイムスタンプで一意なキーにしてPhaserキャッシュ衝突を回避

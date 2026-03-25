@@ -29,19 +29,25 @@ export class ShipImageGenerator {
       // ベース画像をアップロードしてimg2imgのファイル名を取得
       let baseImageName: string | null = null;
       if (baseBlob) {
-        const form = new FormData();
-        form.append("image", baseBlob, "base_ship.png");
-        const up = await fetch(`${COMFY_URL}/upload/image`, {
-          method: "POST", body: form,
-          signal: AbortSignal.timeout(8000),
-        });
-        if (up.ok) {
-          const json = (await up.json()) as { name: string };
-          baseImageName = json.name;
+        try {
+          const form = new FormData();
+          form.append("image", baseBlob, "base_ship.png");
+          const up = await fetch(`${COMFY_URL}/upload/image`, {
+            method: "POST", body: form,
+            signal: AbortSignal.timeout(8000),
+          });
+          if (up.ok) {
+            const json = (await up.json()) as { name: string };
+            baseImageName = json.name;
+            console.log("[ShipImageGenerator] Uploaded base image:", baseImageName);
+          }
+        } catch {
+          console.warn("[ShipImageGenerator] Failed to upload base image, falling back to txt2img");
         }
       }
 
       const workflow = buildWorkflow(weights, clientId, baseImageName);
+      console.log("[ShipImageGenerator] Submitting workflow, img2img:", !!baseImageName);
 
       // ① ワークフローをキュー投入
       const queueRes = await fetch(`${COMFY_URL}/prompt`, {
@@ -50,13 +56,20 @@ export class ShipImageGenerator {
         body: JSON.stringify({ prompt: workflow, client_id: clientId }),
         signal: AbortSignal.timeout(8000),
       });
-      if (!queueRes.ok) return null;
+      if (!queueRes.ok) {
+        console.warn("[ShipImageGenerator] Queue submit failed:", queueRes.status);
+        return null;
+      }
 
       const { prompt_id } = (await queueRes.json()) as { prompt_id: string };
+      console.log("[ShipImageGenerator] Job queued:", prompt_id);
 
-      // ② 完了をポーリング (最大 90 秒)
-      return await pollResult(prompt_id);
-    } catch {
+      // ② 完了をポーリング (最大 120 秒)
+      const result = await pollResult(prompt_id);
+      console.log("[ShipImageGenerator] Result:", result ? "success" : "null");
+      return result;
+    } catch (e) {
+      console.error("[ShipImageGenerator] Error:", e);
       return null;
     }
   }
@@ -67,9 +80,9 @@ export class ShipImageGenerator {
 // ─────────────────────────────────────────────────────────
 
 async function pollResult(promptId: string): Promise<string | null> {
-  const DEADLINE = Date.now() + 90_000;
+  const DEADLINE = Date.now() + 120_000;
   while (Date.now() < DEADLINE) {
-    await sleep(1200);
+    await sleep(1500);
     try {
       const res = await fetch(`${COMFY_URL}/history/${promptId}`,
         { signal: AbortSignal.timeout(5000) });
@@ -77,7 +90,14 @@ async function pollResult(promptId: string): Promise<string | null> {
 
       const history = (await res.json()) as Record<string, ComfyHistory>;
       const entry   = history[promptId];
-      if (!entry?.status?.completed) continue;
+      if (!entry) continue; // まだキューに入っている
+
+      // エラーで終了した場合は即座に中断
+      if (entry.status?.status_str === "error") {
+        console.warn("[ShipImageGenerator] ComfyUI job failed:", promptId);
+        return null;
+      }
+      if (!entry.status?.completed) continue;
 
       // 出力ノードから最初の画像を取得
       for (const nodeOut of Object.values(entry.outputs)) {
@@ -94,6 +114,7 @@ async function pollResult(promptId: string): Promise<string | null> {
       // continue polling
     }
   }
+  console.warn("[ShipImageGenerator] Timed out waiting for job:", promptId);
   return null;
 }
 
@@ -202,9 +223,7 @@ function buildPositivePrompt(w: Weights): string {
     "no_humans, spacecraft, mecha, science_fiction, top-down_view, from_above",
     "game_sprite, simple_background, white_background, single_object",
     "(nose pointing up:1.6), (engine exhaust at bottom:1.5)",
-    "(crimson red hull:1.5), (scarlet armor:1.4), dark red metallic body",
-    "cyberpunk, neon_cyan, glowing_edges, circuit_pattern, neon_orange_trim",
-    "holographic_cockpit, plasma_thruster, mechanical_detail",
+    "metallic hull, glowing engine, mechanical_detail, plasma_thruster",
     speed, weapon, wing,
   ].join(", ");
 }
@@ -287,6 +306,6 @@ function buildWorkflow(weights: Weights, _clientId: string, baseImageName: strin
 // ─────────────────────────────────────────────────────────
 
 interface ComfyHistory {
-  status: { completed: boolean };
+  status: { completed: boolean; status_str?: string };
   outputs: Record<string, { images?: Array<{ filename: string; subfolder: string; type: string }> }>;
 }
