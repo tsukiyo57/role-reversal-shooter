@@ -50,12 +50,20 @@ export class GameScene extends Phaser.Scene {
   private lastPlayerShot = 0;
   private readonly PLAYER_FIRE_RATE = 280;
   private heroShootTimer = 0;
+  private heroTextureKey: string | null = null;
 
   constructor() { super("GameScene"); }
 
-  init(data: { stage?: number; weights?: Weights }): void {
+  preload(): void {
+    if (!this.textures.exists("hero_default")) {
+      this.load.image("hero_default", "hero_default.png");
+    }
+  }
+
+  init(data: { stage?: number; weights?: Weights; heroTextureKey?: string | null }): void {
     if (data.stage)   this.stage   = data.stage;
     if (data.weights) this.weights = { ...data.weights };
+    this.heroTextureKey = data.heroTextureKey ?? null;
     this.playerHp       = PLAYER_HP;
     this.heroLives      = HERO_LIVES;
     this.heroInvincible = false;
@@ -134,7 +142,19 @@ export class GameScene extends Phaser.Scene {
   private initEntities(): void {
     // ── ヒーロー (画面下部) ──
     this.heroRt = this.add.renderTexture(W / 2, HERO_INIT_Y, 90, 90).setOrigin(0.5, 0.5);
-    ShipVisualizer.bake(this, this.heroRt, this.weights);
+    const texKey = (this.heroTextureKey && this.textures.exists(this.heroTextureKey))
+      ? this.heroTextureKey
+      : (this.textures.exists("hero_default") ? "hero_default" : null);
+    if (texKey) {
+      const tempImg = this.add.image(-1000, -1000, texKey);
+      const src = this.textures.get(texKey).getSourceImage() as HTMLImageElement;
+      const sc = Math.min(88 / src.width, 88 / src.height);
+      tempImg.setScale(sc);
+      this.heroRt.draw(tempImg, 45, 45);
+      tempImg.destroy();
+    } else {
+      ShipVisualizer.bake(this, this.heroRt, this.weights);
+    }
 
     this.hero = this.add.image(W / 2, HERO_INIT_Y, "__DEFAULT").setAlpha(0);
     this.physics.add.existing(this.hero);
@@ -392,7 +412,8 @@ export class GameScene extends Phaser.Scene {
     const prevWeights = { ...this.weights };
     const newWeights  = updateWeights(this.weights, this.signals);
 
-    this.scene.start("StageClearScene", { stage: this.stage, prevWeights, newWeights });
+    const prevHeroKey = this.heroTextureKey ?? (this.textures.exists("hero_default") ? "hero_default" : null);
+    this.scene.start("StageClearScene", { stage: this.stage, prevWeights, newWeights, prevHeroTextureKey: prevHeroKey });
   }
 
   private gameOver(): void {

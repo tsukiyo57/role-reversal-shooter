@@ -13,13 +13,17 @@ export class StageClearScene extends Phaser.Scene {
   private stage = 1;
   private prevWeights: Weights = {} as Weights;
   private newWeights:  Weights = {} as Weights;
+  private aiTextureKey: string | null = null;
+  private prevHeroTextureKey: string | null = null;
 
   constructor() { super("StageClearScene"); }
 
-  init(data: { stage: number; prevWeights: Weights; newWeights: Weights }): void {
-    this.stage       = data.stage;
-    this.prevWeights = data.prevWeights;
-    this.newWeights  = data.newWeights;
+  init(data: { stage: number; prevWeights: Weights; newWeights: Weights; prevHeroTextureKey?: string | null }): void {
+    this.stage              = data.stage;
+    this.prevWeights        = data.prevWeights;
+    this.newWeights         = data.newWeights;
+    this.prevHeroTextureKey = data.prevHeroTextureKey ?? null;
+    this.aiTextureKey       = null;
   }
 
   create(): void {
@@ -64,9 +68,18 @@ export class StageClearScene extends Phaser.Scene {
       fontFamily: "monospace", fontSize: "22px", color: "#336655",
     }).setOrigin(0.5, 0.5);
 
-    // 進化前: 手続き型 (暗め)
+    // 進化前: AI生成済みテクスチャがあればそれを使用、なければ手続き型
     const rtPrev = this.add.renderTexture(prevX, shipY, 100, 100).setOrigin(0.5, 0.5).setAlpha(0.55);
-    ShipVisualizer.bake(this, rtPrev, this.prevWeights);
+    if (this.prevHeroTextureKey && this.textures.exists(this.prevHeroTextureKey)) {
+      const tempImg = this.add.image(-1000, -1000, this.prevHeroTextureKey);
+      const src = this.textures.get(this.prevHeroTextureKey).getSourceImage() as HTMLImageElement;
+      const sc = Math.min(88 / src.width, 88 / src.height);
+      tempImg.setScale(sc);
+      rtPrev.draw(tempImg, 50, 50);
+      tempImg.destroy();
+    } else {
+      ShipVisualizer.bake(this, rtPrev, this.prevWeights);
+    }
     rtPrev.setScale(1.3);
 
     // 進化後: AI 生成を試みる (ローディング表示 → 差し替え)
@@ -125,7 +138,7 @@ export class StageClearScene extends Phaser.Scene {
     btn.on("pointerover",  () => { btn.fillColor = 0x003322; });
     btn.on("pointerout",   () => { btn.fillColor = 0x002211; });
     btn.on("pointerdown",  () => {
-      this.scene.start("GameScene", { stage: this.stage + 1, weights: { ...this.newWeights } });
+      this.scene.start("GameScene", { stage: this.stage + 1, weights: { ...this.newWeights }, heroTextureKey: this.aiTextureKey });
     });
 
     this.cameras.main.fadeIn(400);
@@ -145,13 +158,30 @@ export class StageClearScene extends Phaser.Scene {
 
     label.setText("AI 生成中…").setColor("#558866");
 
+    // 手続き型RTをベース画像としてキャプチャ（平面視を保証するため）
+    const baseBlob = await new Promise<Blob | null>((resolve) => {
+      try {
+        rt.snapshot((snap) => {
+          if (!(snap instanceof HTMLImageElement)) { resolve(null); return; }
+          const canvas = document.createElement("canvas");
+          canvas.width = 512; canvas.height = 512;
+          const ctx = canvas.getContext("2d")!;
+          ctx.fillStyle = "white";
+          ctx.fillRect(0, 0, 512, 512);
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(snap, 0, 0, 512, 512);
+          canvas.toBlob(b => resolve(b), "image/png");
+        });
+      } catch { resolve(null); }
+    });
+
     // 生成中アニメーション
     const loadingTween = this.tweens.add({
       targets: rt, alpha: { from: 0.3, to: 0.9 },
       duration: 400, yoyo: true, repeat: -1,
     });
 
-    const blobUrl = await ShipImageGenerator.generate(this.newWeights);
+    const blobUrl = await ShipImageGenerator.generate(this.newWeights, baseBlob);
 
     loadingTween.stop();
     this.tweens.killTweensOf(rt);
@@ -159,18 +189,17 @@ export class StageClearScene extends Phaser.Scene {
     if (!blobUrl || !this.scene.isActive()) return;
 
     // 生成成功: 画像テクスチャとして読み込んでRTに差し替え
-    const key = `ai_ship_s${this.stage}`;
-    this.load.image(key, blobUrl);
-    this.load.once("complete", () => {
+    // タイムスタンプで一意なキーにしてPhaserキャッシュ衝突を回避
+    const key = `ai_ship_${Date.now()}`;
+
+    const onLoaded = () => {
+      if (!this.scene.isActive()) return;
       const img = this.add.image(x, y, key).setOrigin(0.5, 0.5);
-      // RT のサイズに合わせてスケール
       const maxSize = 130;
       const tex = this.textures.get(key).getSourceImage() as HTMLImageElement;
       const scale = Math.min(maxSize / tex.width, maxSize / tex.height);
       img.setScale(scale);
       img.setDepth(rt.depth + 1);
-
-      // 元の RT を非表示
       rt.setVisible(false);
 
       this.tweens.add({
@@ -178,10 +207,19 @@ export class StageClearScene extends Phaser.Scene {
         duration: 900, yoyo: true, repeat: -1,
       });
 
+      this.aiTextureKey = key;
       label.setText("AI 生成").setColor("#00ffaa");
       URL.revokeObjectURL(blobUrl);
-    });
-    this.load.start();
+    };
+
+    if (this.textures.exists(key)) {
+      // 既にキャッシュ済み (通常は起きないがフォールバック)
+      onLoaded();
+    } else {
+      this.load.image(key, blobUrl);
+      this.load.once("complete", onLoaded);
+      this.load.start();
+    }
   }
 
   // ─────────────────────────────────────────────────────────

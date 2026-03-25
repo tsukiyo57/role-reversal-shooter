@@ -19,11 +19,29 @@ export class ShipImageGenerator {
     }
   }
 
-  /** ウェイトから機体画像を生成して Blob URL を返す。失敗時は null。 */
-  static async generate(weights: Weights): Promise<string | null> {
+  /** ウェイトから機体画像を生成して Blob URL を返す。失敗時は null。
+   *  baseBlob: 手続き型描画のキャプチャ。img2img で視点を固定するために使う。
+   */
+  static async generate(weights: Weights, baseBlob?: Blob | null): Promise<string | null> {
     try {
       const clientId = crypto.randomUUID();
-      const workflow = buildWorkflow(weights, clientId);
+
+      // ベース画像をアップロードしてimg2imgのファイル名を取得
+      let baseImageName: string | null = null;
+      if (baseBlob) {
+        const form = new FormData();
+        form.append("image", baseBlob, "base_ship.png");
+        const up = await fetch(`${COMFY_URL}/upload/image`, {
+          method: "POST", body: form,
+          signal: AbortSignal.timeout(8000),
+        });
+        if (up.ok) {
+          const json = (await up.json()) as { name: string };
+          baseImageName = json.name;
+        }
+      }
+
+      const workflow = buildWorkflow(weights, clientId, baseImageName);
 
       // ① ワークフローをキュー投入
       const queueRes = await fetch(`${COMFY_URL}/prompt`, {
@@ -69,7 +87,8 @@ async function pollResult(promptId: string): Promise<string | null> {
                   + `&subfolder=${encodeURIComponent(img.subfolder)}`
                   + `&type=${encodeURIComponent(img.type)}`;
         const blob = await (await fetch(url, { signal: AbortSignal.timeout(10_000) })).blob();
-        return URL.createObjectURL(blob);
+        const transparent = await removeBackground(blob);
+        return URL.createObjectURL(transparent);
       }
     } catch {
       // continue polling
@@ -82,53 +101,124 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** 黒背景をCanvas経由で透過に変換して新しいBlobを返す */
+async function removeBackground(blob: Blob): Promise<Blob> {
+  const img = await createImageBitmap(blob);
+  const canvas = document.createElement("canvas");
+  canvas.width  = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext("2d")!;
+  ctx.drawImage(img, 0, 0);
+  const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const px = data.data;
+  const w = canvas.width, h = canvas.height;
+
+  // 画像端から連続する明るいピクセルのみを透過（フラッドフィル）
+  // 中央の機体白部分は除去しない
+  const visited = new Uint8Array(w * h);
+  const queue: number[] = [];
+
+  const isBright = (idx: number) => {
+    const r = px[idx], g = px[idx + 1], b = px[idx + 2];
+    // 彩度が低く明るいピクセルのみ背景と判定（色のついた機体部分を保護）
+    const brightness = (r + g + b) / 3;
+    const saturation = Math.max(r, g, b) - Math.min(r, g, b);
+    return brightness > 230 && saturation < 20;
+  };
+
+  // 4辺のピクセルをシードとしてキューに追加
+  for (let x = 0; x < w; x++) { queue.push(0 * w + x); queue.push((h - 1) * w + x); }
+  for (let y = 0; y < h; y++) { queue.push(y * w + 0); queue.push(y * w + (w - 1)); }
+
+  while (queue.length > 0) {
+    const pos = queue.pop()!;
+    if (visited[pos]) continue;
+    visited[pos] = 1;
+    const pidx = pos * 4;
+    if (!isBright(pidx)) continue;
+    px[pidx + 3] = 0; // 透過
+    const x = pos % w, y = Math.floor(pos / w);
+    if (x > 0)     queue.push(pos - 1);
+    if (x < w - 1) queue.push(pos + 1);
+    if (y > 0)     queue.push(pos - w);
+    if (y < h - 1) queue.push(pos + w);
+  }
+
+  // 背景除去済みピクセルに隣接する低彩度グレー（影）も透過にする
+  const shadow = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const pos = y * w + x;
+      const pidx = pos * 4;
+      if (px[pidx + 3] > 0) continue; // 既に透過済みはスキップ
+      // 隣接4ピクセルにまだ不透明なものがあるか確認
+      const neighbors = [pos - 1, pos + 1, pos - w, pos + w];
+      const nextToOpaque = neighbors.some(n => n >= 0 && n < w * h && px[n * 4 + 3] > 0);
+      if (!nextToOpaque) continue;
+      // 影判定: 低彩度かつ中間輝度（白背景に落ちた影）
+      const r = px[pidx], g = px[pidx + 1], b = px[pidx + 2];
+      const brightness = (r + g + b) / 3;
+      const saturation = Math.max(r, g, b) - Math.min(r, g, b);
+      if (brightness > 150 && saturation < 40) shadow[pos] = 1;
+    }
+  }
+  for (let i = 0; i < w * h; i++) {
+    if (shadow[i]) px[i * 4 + 3] = 0;
+  }
+
+  ctx.putImageData(data, 0, 0);
+  return new Promise((resolve) => canvas.toBlob((b) => resolve(b!), "image/png"));
+}
+
 // ─────────────────────────────────────────────────────────
 //  プロンプト生成
 // ─────────────────────────────────────────────────────────
 
 function buildPositivePrompt(w: Weights): string {
-  const { dodgeSide, burstTiming, preferredDist, moveSpeed } = w;
+  const { dodgeSide, burstTiming, moveSpeed } = w;
 
   const speed  = moveSpeed > 0.65
-    ? "sleek high-speed blue fighter jet, thin aerodynamic body"
+    ? "sleek fighter, thin fuselage, sharp swept wings"
     : moveSpeed < 0.35
-    ? "heavy armored purple battlecruiser, thick hull plating"
-    : "blue combat spacecraft, balanced design";
+    ? "heavy cruiser, thick armor, wide body"
+    : "balanced fighter craft";
 
   const weapon = burstTiming > 0.65
-    ? "multiple burst cannons, gatling gun pods on wings"
+    ? "multi-barrel gatling guns, spread cannons on wings"
     : burstTiming < 0.35
-    ? "single massive precision railgun, sniper configuration"
-    : "twin cannons, dual weapon hardpoints";
-
-  const dist   = preferredDist > 0.65
-    ? "long extended barrel weapons, long-range sniper craft"
-    : preferredDist < 0.35
-    ? "close-combat interceptor, short stubby cannons, claw grips"
-    : "medium range weapons, standard loadout";
+    ? "single long railgun, precision sniper barrel"
+    : "twin forward cannons";
 
   const wing   = dodgeSide > 0.65
-    ? "right wing larger and more prominent, asymmetric wing design"
+    ? "right wing larger than left, asymmetric design"
     : dodgeSide < 0.35
-    ? "left wing larger and more prominent, asymmetric wing design"
-    : "symmetric swept wings";
+    ? "left wing larger than right, asymmetric design"
+    : "symmetric delta wings";
 
+  // 視点語を最前に並べることでモデルの視点バイアスを強制
   return [
-    "masterpiece, best quality",
-    "anime-style sci-fi spaceship top-down view",
-    speed, weapon, dist, wing,
-    "glowing engine exhaust, neon cockpit, space background",
-    "game sprite, clean lineart, detailed illustration",
-    "1girl is not here, no humans",
+    "2d top down, overhead view, top-down view, view from directly above",
+    "masterpiece, best quality, highres",
+    "no_humans, spacecraft, mecha, science_fiction, top-down_view, from_above",
+    "game_sprite, simple_background, white_background, single_object",
+    "(nose pointing up:1.6), (engine exhaust at bottom:1.5)",
+    "(crimson red hull:1.5), (scarlet armor:1.4), dark red metallic body",
+    "cyberpunk, neon_cyan, glowing_edges, circuit_pattern, neon_orange_trim",
+    "holographic_cockpit, plasma_thruster, mechanical_detail",
+    speed, weapon, wing,
   ].join(", ");
 }
 
 function buildNegativePrompt(): string {
   return [
-    "nsfw, low quality, blurry, watermark, text, logo",
-    "human, person, character, face",
-    "multiple ships, crowded",
-    "bad anatomy, worst quality",
+    "worst quality, low quality, blurry, watermark, text, signature",
+    "human, person, face, body, 1girl, 1boy, character",
+    "side view, front view, isometric, 3/4 view, perspective view, dutch angle, low angle",
+    "diagonal, tilted, angled, foreshortening, vanishing point, depth of field",
+    "background, scenery, landscape, space background, nebula, stars, planet, sky",
+    "interior, corridor, hallway, room, tunnel, environment",
+    "shadow, drop shadow, cast shadow, soft shadow, hard shadow",
+    "border, frame, panel, dramatic lighting, cinematic, bokeh, glow effect",
   ].join(", ");
 }
 
@@ -136,7 +226,22 @@ function buildNegativePrompt(): string {
 //  ComfyUI ワークフロー (animagine-xl-4.0 / SDXL)
 // ─────────────────────────────────────────────────────────
 
-function buildWorkflow(weights: Weights, _clientId: string): object {
+function buildWorkflow(weights: Weights, _clientId: string, baseImageName: string | null): object {
+  const seed = Math.floor(Math.random() * 2 ** 32);
+
+  // img2img: ベース画像あり → LoadImage→VAEEncode、denoise=0.7で視点を保持
+  // txt2img: ベース画像なし → EmptyLatentImage、denoise=1
+  const useImg2Img = !!baseImageName;
+
+  const latentNode = useImg2Img
+    ? {
+        "4a": { class_type: "LoadImage",  inputs: { image: baseImageName, upload: "image" } },
+        "4b": { class_type: "VAEEncode",  inputs: { pixels: ["4a", 0], vae: ["1", 2] } },
+      }
+    : {
+        "4b": { class_type: "EmptyLatentImage", inputs: { width: 512, height: 512, batch_size: 1 } },
+      };
+
   return {
     "1": {
       class_type: "CheckpointLoaderSimple",
@@ -150,23 +255,20 @@ function buildWorkflow(weights: Weights, _clientId: string): object {
       class_type: "CLIPTextEncode",
       inputs: { clip: ["1", 1], text: buildNegativePrompt() },
     },
-    "4": {
-      class_type: "EmptyLatentImage",
-      inputs: { width: 512, height: 512, batch_size: 1 },
-    },
+    ...latentNode,
     "5": {
       class_type: "KSampler",
       inputs: {
         model:        ["1", 0],
         positive:     ["2", 0],
         negative:     ["3", 0],
-        latent_image: ["4", 0],
-        seed:         Math.floor(Math.random() * 2 ** 32),
-        steps:        20,
-        cfg:          7,
-        sampler_name: "dpmpp_2m",
+        latent_image: ["4b", 0],
+        seed,
+        steps:        25,
+        cfg:          5,
+        sampler_name: "dpmpp_2m_sde",
         scheduler:    "karras",
-        denoise:      1,
+        denoise:      useImg2Img ? 0.85 : 1,
       },
     },
     "6": {
