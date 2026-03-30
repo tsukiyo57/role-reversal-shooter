@@ -165,7 +165,32 @@ export class StageClearScene extends Phaser.Scene {
       duration: 400, yoyo: true, repeat: -1,
     });
 
-    const blobUrl = await ShipImageGenerator.generate(this.newWeights);
+    // 前ステージの機体テクスチャを 1024×1024 の Blob に変換してベース画像として渡す
+    let baseBlob: Blob | null = null;
+    if (this.prevHeroTextureKey && this.textures.exists(this.prevHeroTextureKey)) {
+      try {
+        const src = this.textures.get(this.prevHeroTextureKey).getSourceImage() as HTMLImageElement;
+        const canvas = document.createElement("canvas");
+        canvas.width = 1024;
+        canvas.height = 1024;
+        const ctx = canvas.getContext("2d")!;
+        // 黒背景を敷いてから機体を中央に描画
+        // 白背景に機体を 70% サイズで中央配置。
+        // ブラーは廃止（翼エッジが失われて次第に省略されるのを防ぐ）。
+        // 周囲に余白を設けることでモデルが翼の外側に増設パーツを追加しやすくする。
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, 1024, 1024);
+        const sc = Math.min(716 / src.width, 716 / src.height); // 70% of 1024
+        const dw = src.width * sc, dh = src.height * sc;
+        ctx.drawImage(src, (1024 - dw) / 2, (1024 - dh) / 2, dw, dh);
+        baseBlob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+        console.log("[StageClearScene] Base blob prepared:", baseBlob?.size ?? 0, "bytes");
+      } catch (e) {
+        console.warn("[StageClearScene] Failed to prepare base blob:", e);
+      }
+    }
+
+    const blobUrl = await ShipImageGenerator.generate(this.newWeights, baseBlob);
 
     loadingTween.stop();
     this.tweens.killTweensOf(placeholder);

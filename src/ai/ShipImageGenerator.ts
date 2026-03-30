@@ -3,7 +3,8 @@ import type { Weights } from "../types";
 // Vite dev server proxies /comfy/* → localhost:8188 (vite.config.ts)
 // In production (GitHub Pages), /comfy/* is unreachable → isAvailable() returns false → fallback
 const COMFY_URL = "/comfy";
-const CHECKPOINT = "ziovXLScifi_v10.safetensors";
+const CHECKPOINT       = "ziovXLScifi_v10.safetensors";
+const CONTROLNET_CANNY = "controlnet-union-sdxl-promax.safetensors";
 
 /**
  * ComfyUI (localhost:8188) を使ってウェイトベースの機体画像を生成する。
@@ -20,13 +21,21 @@ export class ShipImageGenerator {
   }
 
   /** ウェイトから機体画像を生成して Blob URL を返す。失敗時は null。
-   *  baseBlob: 手続き型描画のキャプチャ。img2img で視点を固定するために使う。
+   *  baseBlob: 前ステージの機体画像。img2img でベース画像として使用し「進化」を表現する。
    */
-  static async generate(weights: Weights): Promise<string | null> {
+  static async generate(weights: Weights, baseBlob?: Blob | null): Promise<string | null> {
     try {
       const clientId = crypto.randomUUID();
-      const workflow = buildWorkflow(weights, clientId);
-      console.log("[ShipImageGenerator] Submitting txt2img workflow");
+
+      // ベース画像があれば ComfyUI にアップロードして img2img を試みる
+      let baseImageName: string | null = null;
+      if (baseBlob) {
+        baseImageName = await uploadBaseImage(baseBlob);
+        console.log("[ShipImageGenerator] Base image uploaded:", baseImageName);
+      }
+
+      const workflow = buildWorkflow(weights, clientId, baseImageName);
+      console.log("[ShipImageGenerator] Submitting", baseImageName ? "img2img" : "txt2img", "workflow");
 
       // ① ワークフローをキュー投入
       const queueRes = await fetch(`${COMFY_URL}/prompt`, {
@@ -57,6 +66,29 @@ export class ShipImageGenerator {
 // ─────────────────────────────────────────────────────────
 //  ヘルパー
 // ─────────────────────────────────────────────────────────
+
+/** ベース画像を ComfyUI にアップロードしてファイル名を返す。失敗時は null。 */
+async function uploadBaseImage(blob: Blob): Promise<string | null> {
+  try {
+    const form = new FormData();
+    form.append("image", blob, "base_ship.png");
+    form.append("overwrite", "true");
+    const res = await fetch(`${COMFY_URL}/upload/image`, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) {
+      console.warn("[ShipImageGenerator] Upload failed:", res.status);
+      return null;
+    }
+    const json = (await res.json()) as { name: string; subfolder?: string };
+    return json.subfolder ? `${json.subfolder}/${json.name}` : json.name;
+  } catch (e) {
+    console.warn("[ShipImageGenerator] Upload error:", e);
+    return null;
+  }
+}
 
 async function pollResult(promptId: string): Promise<string | null> {
   const DEADLINE = Date.now() + 120_000;
@@ -118,12 +150,13 @@ async function removeBackground(blob: Blob): Promise<Blob> {
   const visited = new Uint8Array(w * h);
   const queue: number[] = [];
 
-  // 純白に近いピクセルのみ背景と判定。機体の白・グレー部分を保護するため厳しめの閾値
+  // 純白 or 純黒に近いピクセルを背景と判定（フラッドフィルなので機体内部は保護される）
   const isBg = (idx: number) => {
     const r = px[idx], g = px[idx + 1], b = px[idx + 2];
     const brightness = (r + g + b) / 3;
     const saturation = Math.max(r, g, b) - Math.min(r, g, b);
-    return brightness > 245 && saturation < 15;
+    return (brightness > 245 && saturation < 15)   // 白背景
+        || (brightness < 18  && saturation < 12);  // 黒背景
   };
 
   // 4辺のピクセルをシードとしてキューに追加
@@ -152,7 +185,7 @@ async function removeBackground(blob: Blob): Promise<Blob> {
 //  プロンプト生成
 // ─────────────────────────────────────────────────────────
 
-function buildPositivePrompt(w: Weights): string {
+function buildPositivePrompt(w: Weights, evolved = false): string {
   const { dodgeSide, burstTiming, moveSpeed } = w;
 
   const speed  = moveSpeed > 0.65
@@ -162,9 +195,9 @@ function buildPositivePrompt(w: Weights): string {
     : "balanced fighter craft";
 
   const weapon = burstTiming > 0.65
-    ? "multi-barrel gatling guns, spread cannons on wings"
+    ? "multi-barrel gatling guns, spread cannons on wings, extra missile pods"
     : burstTiming < 0.35
-    ? "single long railgun, precision sniper barrel"
+    ? "single long railgun, precision sniper barrel, targeting sensors"
     : "twin forward cannons";
 
   const wing   = dodgeSide > 0.65
@@ -173,6 +206,14 @@ function buildPositivePrompt(w: Weights): string {
     ? "left wing larger than right, asymmetric design"
     : "symmetric delta wings";
 
+  // 進化時のみ追加する「強化・部品増加」プロンプト
+  const evolutionParts = evolved ? [
+    "(heavily upgraded warship:1.4), (additional armor plating:1.3)",
+    "(extra weapon hardpoints:1.3), (bolted-on booster pods:1.2)",
+    "(reinforced hull panels:1.2), (additional thruster nozzles:1.2)",
+    "battle-scarred, modified, overbuilt, more complex than before",
+  ] : [];
+
   // 視点語を最前に並べることでモデルの視点バイアスを強制
   return [
     "2d top down, overhead view, top-down view, view from directly above",
@@ -180,8 +221,11 @@ function buildPositivePrompt(w: Weights): string {
     "no_humans, spacecraft, mecha, science_fiction, top-down_view, from_above",
     "game_sprite, simple_background, white_background, single_object",
     "(nose pointing up:1.6), (engine exhaust at bottom:1.5)",
+    "(large spacecraft filling the frame:1.5), (zoomed in, close-up:1.4)",
+    "(wide swept wings must be preserved:1.5), (keep both wings intact:1.4)",
     "metallic hull, glowing engine, mechanical_detail, plasma_thruster",
     speed, weapon, wing,
+    ...evolutionParts,
   ].join(", ");
 }
 
@@ -195,6 +239,8 @@ function buildNegativePrompt(): string {
     "interior, corridor, hallway, room, tunnel, environment",
     "shadow, drop shadow, cast shadow, soft shadow, hard shadow",
     "border, frame, panel, dramatic lighting, cinematic, bokeh, glow effect",
+    "small, tiny, distant, far away, miniature, shrunk, zoomed out, wide shot",
+    "no wings, missing wings, broken wings, thin wings, narrow wings, stub wings",
   ].join(", ");
 }
 
@@ -202,9 +248,100 @@ function buildNegativePrompt(): string {
 //  ComfyUI ワークフロー (animagine-xl-4.0 / SDXL)
 // ─────────────────────────────────────────────────────────
 
-function buildWorkflow(weights: Weights, _clientId: string): object {
+function buildWorkflow(weights: Weights, _clientId: string, baseImageName: string | null): object {
   const seed = Math.floor(Math.random() * 2 ** 32);
 
+  if (baseImageName) {
+    // ── img2img + ControlNet Canny: 前ステージの輪郭を保持しながら進化を表現 ──
+    // ノード構成:
+    //   1  CheckpointLoaderSimple
+    //   2  CLIPTextEncode (positive)
+    //   3  CLIPTextEncode (negative)
+    //   4  LoadImage (ベース画像)
+    //   4b CannyEdgePreprocessor (翼・機体輪郭を抽出)
+    //   4c ControlNetLoader
+    //   4d ControlNetApplyAdvanced (positive/negativeに適用)
+    //   4e VAEEncode (img2img 用 latent)
+    //   5  KSampler
+    //   6  VAEDecode
+    //   7  SaveImage
+    return {
+      "1": {
+        class_type: "CheckpointLoaderSimple",
+        inputs: { ckpt_name: CHECKPOINT },
+      },
+      "2": {
+        class_type: "CLIPTextEncode",
+        inputs: { clip: ["1", 1], text: buildPositivePrompt(weights, true) },
+      },
+      "3": {
+        class_type: "CLIPTextEncode",
+        inputs: { clip: ["1", 1], text: buildNegativePrompt() },
+      },
+      "4": {
+        class_type: "LoadImage",
+        inputs: { image: baseImageName },
+      },
+      // Canny エッジ抽出（翼・機体の輪郭線を ControlNet に渡す）
+      "4b": {
+        class_type: "CannyEdgePreprocessor",
+        inputs: {
+          image:      ["4", 0],
+          low_threshold:  100,
+          high_threshold: 200,
+          resolution:    1024,
+        },
+      },
+      "4c": {
+        class_type: "ControlNetLoader",
+        inputs: { control_net_name: CONTROLNET_CANNY },
+      },
+      // ControlNet を positive/negative conditioning 両方に適用
+      // strength 0.7: 輪郭を強く保持しつつプロンプトによる追加パーツの余地を残す
+      // end_percent 0.75: 後半 25% ステップは自由生成（追加部品が自然に馴染む）
+      "4d": {
+        class_type: "ControlNetApplyAdvanced",
+        inputs: {
+          positive:         ["2", 0],
+          negative:         ["3", 0],
+          control_net:      ["4c", 0],
+          image:            ["4b", 0],
+          strength:         0.7,
+          start_percent:    0.0,
+          end_percent:      0.75,
+        },
+      },
+      "4e": {
+        class_type: "VAEEncode",
+        inputs: { pixels: ["4", 0], vae: ["1", 2] },
+      },
+      "5": {
+        class_type: "KSampler",
+        inputs: {
+          model:        ["1", 0],
+          positive:     ["4d", 0],
+          negative:     ["4d", 1],
+          latent_image: ["4e", 0],
+          seed,
+          steps:        30,
+          cfg:          7,
+          sampler_name: "dpmpp_2m_sde",
+          scheduler:    "karras",
+          denoise:      0.80,
+        },
+      },
+      "6": {
+        class_type: "VAEDecode",
+        inputs: { samples: ["5", 0], vae: ["1", 2] },
+      },
+      "7": {
+        class_type: "SaveImage",
+        inputs: { images: ["6", 0], filename_prefix: "hero_ship" },
+      },
+    };
+  }
+
+  // ── txt2img: ベース画像なし (初回生成) ──
   return {
     "1": {
       class_type: "CheckpointLoaderSimple",
